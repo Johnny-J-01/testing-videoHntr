@@ -56,3 +56,13 @@ Open the page, type your admin key, click **Server info** (confirms ffmpeg works
 
 - Files you upload stay in your Drive until you press **Delete**.
 - The admin key only protects this test app. Use a long random value, and delete the Render service when you are done.
+
+## 5. Compare: direct from Drive vs download-to-disk first
+
+The **Compare clip / Compare audio** buttons run the same job two ways on the same file, in the same request:
+
+- **A (direct):** ffmpeg reads straight from Drive.
+- **B (download first):** the whole file is downloaded to the server's `/tmp`, then ffmpeg processes the local copy. The result shows the download time and the processing time separately.
+- **C (already on disk):** the processing-only part of B. This is what later jobs on the same video would cost if you cached the file.
+
+Tips: run each comparison twice and ignore the first run (cold start). Use `runs=2` or `3` to average and to alternate which method goes first. On a big file with Audio (full), keep `runs=1`, because the request can hit Render's request time limit. `diskUsedMB` shows how much temp disk the download-first method needed. Files are deleted after each run.

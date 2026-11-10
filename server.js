@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const { pipeline } = require('stream/promises');
 
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
 const FFPROBE = process.env.FFPROBE_PATH || require('ffprobe-static').path;
@@ -233,6 +234,113 @@ app.get('/api/redirect-check/:id', validId, wrap(async (req, res) => {
     report.hop2_withAuthHeaderKept = pick(second);
   }
   res.json(report);
+}));
+
+// ---------- compare: process directly from Drive vs download to disk first ----------
+async function ffmpegJob({ task, input, headers, start, duration, reencode, seconds, out }) {
+  const args = ['-y', '-hide_banner', '-loglevel', 'error'];
+  if (headers) args.push('-headers', headers);
+  if (task === 'clip') {
+    args.push(
+      '-ss', String(start), '-i', input, '-t', String(duration),
+      ...(reencode
+        ? ['-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac']
+        : ['-c', 'copy', '-avoid_negative_ts', 'make_zero']),
+      out
+    );
+  } else {
+    args.push('-i', input, '-vn', '-ac', '1', '-b:a', '32k', ...(seconds ? ['-t', String(seconds)] : []), out);
+  }
+  const r = await run(FFMPEG, args);
+  if (r.code !== 0) throw new Error(`ffmpeg failed (exit ${r.code}, signal ${r.signal}): ${r.stderr}`);
+}
+
+async function downloadToDisk(id, dest) {
+  const r = await drive.files.get({ fileId: id, alt: 'media' }, { responseType: 'stream' });
+  await pipeline(r.data, fs.createWriteStream(dest));
+}
+
+const avg = (list) => Math.round(list.reduce((a, b) => a + b, 0) / list.length);
+
+// ?task=clip|audio  &start=30&duration=10 (&reencode=1)  &seconds=60 (audio)  &runs=1..3
+app.get('/api/compare/:id', validId, wrap(async (req, res) => {
+  const id = req.params.id;
+  const task = req.query.task === 'audio' ? 'audio' : 'clip';
+  const runs = Math.min(3, Math.max(1, Number(req.query.runs) || 1));
+  const params = {
+    task,
+    start: Math.max(0, Number(req.query.start) || 0),
+    duration: Math.min(120, Number(req.query.duration) || 10),
+    reencode: !!req.query.reencode,
+    seconds: Number(req.query.seconds) || 0,
+  };
+  const ext = task === 'clip' ? '.mp4' : '.mp3';
+
+  let peakRss = process.memoryUsage().rss;
+  const sampler = setInterval(() => (peakRss = Math.max(peakRss, process.memoryUsage().rss)), 200);
+  const results = [];
+
+  try {
+    for (let i = 0; i < runs; i++) {
+      const directFirst = i % 2 === 0; // alternate the order so neither method always goes first
+      const entry = { run: i + 1, order: directFirst ? 'direct first' : 'download first' };
+
+      const doDirect = async () => {
+        const out = tmpFile(ext);
+        const headers = await ffHeaders(); // token fetched before the timer starts
+        const t = Date.now();
+        try {
+          await ffmpegJob({ ...params, input: mediaUrl(id), headers, out });
+          entry.directMs = Date.now() - t;
+        } finally {
+          rm(out);
+        }
+      };
+
+      const doDownload = async () => {
+        const local = tmpFile('.bin');
+        const out = tmpFile(ext);
+        try {
+          let t = Date.now();
+          await downloadToDisk(id, local);
+          entry.downloadMs = Date.now() - t;
+          entry.diskUsedMB = mb(fs.statSync(local).size);
+          t = Date.now();
+          await ffmpegJob({ ...params, input: local, out });
+          entry.localProcessMs = Date.now() - t;
+          entry.downloadThenProcessMs = entry.downloadMs + entry.localProcessMs;
+        } finally {
+          rm(local);
+          rm(out);
+        }
+      };
+
+      if (directFirst) { await doDirect(); await doDownload(); }
+      else { await doDownload(); await doDirect(); }
+      results.push(entry);
+    }
+  } finally {
+    clearInterval(sampler);
+  }
+
+  const direct = avg(results.map((r) => r.directMs));
+  const viaDisk = avg(results.map((r) => r.downloadThenProcessMs));
+  res.json({
+    params,
+    results,
+    averageMs: {
+      A_directFromDrive: direct,
+      B_downloadThenProcess: viaDisk,
+      B_downloadPart: avg(results.map((r) => r.downloadMs)),
+      C_processOnlyIfAlreadyOnDisk: avg(results.map((r) => r.localProcessMs)),
+    },
+    verdict:
+      direct <= viaDisk
+        ? `Direct from Drive was faster: ${direct} ms vs ${viaDisk} ms`
+        : `Download-then-process was faster: ${viaDisk} ms vs ${direct} ms`,
+    peakBackendRssMB: mb(peakRss),
+    note: 'C is what every later job on the same video would cost if the file were cached on disk.',
+  });
 }));
 
 app.delete('/api/files/:id', validId, wrap(async (req, res) => {
