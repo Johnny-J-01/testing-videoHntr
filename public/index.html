@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drive + ffmpeg test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.2rem; }
+  section { margin: 1.2rem 0; }
+  input, button { font: inherit; padding: .35rem .6rem; }
+  button { cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; }
+  td { border-top: 1px solid #8884; padding: .4rem .3rem; vertical-align: top; }
+  .row-actions button { margin: 0 .2rem .2rem 0; }
+  pre { background: #8881; padding: .8rem; overflow-x: auto; white-space: pre-wrap; min-height: 4rem; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+<h1>Drive + ffmpeg test</h1>
+
+<section>
+  <label>Admin key: <input id="key" type="password" size="30"></label>
+  <button id="info">Server info</button>
+</section>
+
+<section>
+  <input id="file" type="file" accept="video/*">
+  <button id="upload">Upload to Drive</button>
+</section>
+
+<section>
+  <button id="refresh">Refresh file list</button>
+  <label style="margin-left:1rem">Clip start (s) <input id="start" type="number" value="30" min="0" style="width:5rem"></label>
+  <label>length (s) <input id="dur" type="number" value="10" min="1" max="120" style="width:5rem"></label>
+  <label><input id="reenc" type="checkbox"> re-encode</label>
+  <table id="files"></table>
+</section>
+
+<pre id="out">Results appear here.</pre>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = $('out');
+
+async function call(path, opts = {}, asBlob = false) {
+  const t = performance.now();
+  out.textContent = 'Working... ' + path;
+  const r = await fetch(path, { ...opts, headers: { 'x-admin-key': $('key').value } });
+  const ms = Math.round(performance.now() - t);
+  if (asBlob && r.ok) return { r, ms };
+  const text = await r.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = text; }
+  out.textContent = `${opts.method || 'GET'} ${path}\nHTTP ${r.status}  (${ms} ms round trip)\n\n` + JSON.stringify(body, null, 2);
+  return { r, body, ms };
+}
+
+async function refresh() {
+  const { r, body } = await call('/api/files');
+  const table = $('files');
+  table.textContent = '';
+  if (!r.ok) return;
+  for (const f of body) {
+    const tr = table.insertRow();
+    const name = tr.insertCell();
+    name.textContent = f.name;
+    const small = document.createElement('small');
+    small.textContent = `  ${(f.size / 1048576).toFixed(1)} MB`;
+    name.append(small);
+    const actions = tr.insertCell();
+    actions.className = 'row-actions';
+    const add = (label, fn) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.onclick = fn;
+      actions.append(b);
+    };
+    const clipQs = () => `start=${$('start').value}&duration=${$('dur').value}${$('reenc').checked ? '&reencode=1' : ''}`;
+    add('Redirect check', () => call(`/api/redirect-check/${f.id}`));
+    add('Probe', () => call(`/api/probe/${f.id}`));
+    add('Audio (60s)', () => call(`/api/audio/${f.id}?seconds=60`));
+    add('Audio (full)', () => call(`/api/audio/${f.id}`));
+    add('Clip', () => call(`/api/clip/${f.id}?${clipQs()}`));
+    add('Clip + download', async () => {
+      const res = await call(`/api/clip/${f.id}?${clipQs()}&download=1`, {}, true);
+      if (!res.r.ok) return;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(await res.r.blob());
+      a.download = 'clip.mp4';
+      a.click();
+      out.textContent = `Clip downloaded (${res.ms} ms). Play it to check it works.`;
+    });
+    add('Delete', async () => {
+      if (confirm('Delete from Drive?')) { await call(`/api/files/${f.id}`, { method: 'DELETE' }); refresh(); }
+    });
+  }
+}
+
+$('info').onclick = () => call('/api/info');
+$('refresh').onclick = refresh;
+$('upload').onclick = async () => {
+  const file = $('file').files[0];
+  if (!file) return alert('Pick a video first');
+  const fd = new FormData();
+  fd.append('video', file);
+  await call('/api/upload', { method: 'POST', body: fd });
+  refresh();
+};
+</script>
+</body>
+</html>
