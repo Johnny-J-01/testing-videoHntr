@@ -43,7 +43,7 @@ function run(cmd, args) {
     p.stdout.on('data', (d) => (stdout += d));
     p.stderr.on('data', (d) => (stderr = (stderr + d).slice(-3000)));
     p.on('error', reject);
-    p.on('close', (code) => resolve({ code, stdout, stderr }));
+    p.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
 }
 const tmpFile = (ext) => path.join(os.tmpdir(), `vh-${crypto.randomUUID()}${ext}`);
@@ -72,6 +72,20 @@ app.get('/api/info', wrap(async (req, res) => {
     ffmpeg: v.stdout.split('\n')[0],
     tmpdir: os.tmpdir(),
     rssMB: mb(process.memoryUsage().rss),
+  });
+}));
+
+// Does ffmpeg itself crash or fail on network access (separate from Drive)?
+app.get('/api/netcheck', wrap(async (req, res) => {
+  const t = Date.now();
+  const r = await run(FFPROBE, ['-v', 'error', '-show_entries', 'format=format_name', 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest']);
+  res.json({
+    ms: Date.now() - t,
+    ffprobePath: FFPROBE,
+    exitCode: r.code,
+    signal: r.signal,
+    stderr: r.stderr,
+    note: 'An HTTP/format error here is fine. A signal (e.g. SIGSEGV) or empty stderr with a non-zero exit means the binary itself breaks on network calls.',
   });
 }));
 
@@ -134,7 +148,7 @@ app.get('/api/probe/:id', validId, wrap(async (req, res) => {
     '-show_format', '-show_streams',
     mediaUrl(req.params.id),
   ]);
-  if (r.code !== 0) return res.status(502).json({ error: 'ffprobe failed', stderr: r.stderr });
+  if (r.code !== 0) return res.status(502).json({ error: 'ffprobe failed', exitCode: r.code, signal: r.signal, stderr: r.stderr });
   const j = JSON.parse(r.stdout);
   res.json({
     ms: Date.now() - t,
@@ -167,7 +181,7 @@ app.get('/api/audio/:id', validId, wrap(async (req, res) => {
   ]);
   if (r.code !== 0) {
     rm(out);
-    return res.status(502).json({ error: 'ffmpeg failed', stderr: r.stderr });
+    return res.status(502).json({ error: 'ffmpeg failed', exitCode: r.code, signal: r.signal, stderr: r.stderr });
   }
   const size = fs.statSync(out).size;
   rm(out);
@@ -194,7 +208,7 @@ app.get('/api/clip/:id', validId, wrap(async (req, res) => {
   ]);
   if (r.code !== 0) {
     rm(out);
-    return res.status(502).json({ error: 'ffmpeg failed', stderr: r.stderr });
+    return res.status(502).json({ error: 'ffmpeg failed', exitCode: r.code, signal: r.signal, stderr: r.stderr });
   }
   if (req.query.download) return res.download(out, 'clip.mp4', () => rm(out));
   const size = fs.statSync(out).size;
