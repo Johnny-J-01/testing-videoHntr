@@ -66,3 +66,16 @@ The **Compare clip / Compare audio** buttons run the same job two ways on the sa
 - **C (already on disk):** the processing-only part of B. This is what later jobs on the same video would cost if you cached the file.
 
 Tips: run each comparison twice and ignore the first run (cold start). Use `runs=2` or `3` to average and to alternate which method goes first. On a big file with Audio (full), keep `runs=1`, because the request can hit Render's request time limit. `diskUsedMB` shows how much temp disk the download-first method needed. Files are deleted after each run.
+
+## 6. Playback straight from Drive
+
+Click **Play (stream)** on a file. The page asks the server for a short-lived stream token, then points a `<video>` tag at `/stream/<fileId>?t=<token>`. The server passes the browser's `Range` request to Drive and relays only the bytes the player asks for. Nothing is written to disk.
+
+What to check:
+- Does it play, and how long until the first frame (shown under the player)?
+- Click far ahead in the timeline. The seek time is shown. It should stay a few seconds, not grow with the position.
+- Press **Show stream stats**. `% of the file` should stay well below 100% if you only watched or seeked a little, which proves the video was not downloaded first.
+- Watch `requestsToDrive`. Players make many small range requests, so this number shows how hard playback leans on Drive's rate limits.
+- The Render **Logs** tab prints one line per range request.
+
+If seeking is slow on a long video, the MP4's metadata is probably at the end of the file. Remux once with `-movflags +faststart` before uploading.

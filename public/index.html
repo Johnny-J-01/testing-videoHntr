@@ -39,6 +39,12 @@
   <table id="files"></table>
 </section>
 
+<section id="playerBox" hidden>
+  <video id="player" controls preload="metadata" style="width:100%;max-width:720px;background:#000"></video>
+  <div><button id="statsBtn">Show stream stats</button></div>
+  <pre id="playLog" style="min-height:2rem"></pre>
+</section>
+
 <pre id="out">Results appear here.</pre>
 
 <script>
@@ -79,6 +85,7 @@ async function refresh() {
       actions.append(b);
     };
     const clipQs = () => `start=${$('start').value}&duration=${$('dur').value}${$('reenc').checked ? '&reencode=1' : ''}`;
+    add('Play (stream)', () => play(f));
     add('Redirect check', () => call(`/api/redirect-check/${f.id}`));
     add('Probe', () => call(`/api/probe/${f.id}`));
     add('Audio (60s)', () => call(`/api/audio/${f.id}?seconds=60`));
@@ -102,6 +109,38 @@ async function refresh() {
   }
 }
 
+
+let streamToken = null;
+let streamFileSize = 0;
+async function play(f) {
+  const { r, body } = await call(`/api/stream-token/${f.id}`);
+  if (!r.ok) return;
+  streamToken = body.token;
+  streamFileSize = Number(f.size);
+  $('playerBox').hidden = false;
+  const v = $('player');
+  const lines = [];
+  const log = (m) => { lines.push(m); $('playLog').textContent = lines.slice(-8).join('\n'); };
+  const t0 = performance.now();
+  let seekStart = 0;
+  v.onloadedmetadata = () => log(`metadata ready after ${Math.round(performance.now() - t0)} ms (duration ${v.duration.toFixed(1)} s)`);
+  v.onloadeddata = () => log(`first frame ready after ${Math.round(performance.now() - t0)} ms`);
+  v.onseeking = () => { seekStart = performance.now(); };
+  v.onseeked = () => log(`seek to ${v.currentTime.toFixed(1)} s finished in ${Math.round(performance.now() - seekStart)} ms`);
+  v.onerror = () => log('player error: ' + (v.error ? v.error.message || v.error.code : 'unknown'));
+  v.src = body.url;
+  v.load();
+  v.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+$('statsBtn').onclick = async () => {
+  if (!streamToken) return;
+  const { r, body } = await call(`/api/stream-stats/${streamToken}`);
+  if (r.ok && streamFileSize) {
+    const pct = ((body.bytesServedMB * 1048576) / streamFileSize * 100).toFixed(1);
+    out.textContent += `\n\nFetched ${body.bytesServedMB} MB of ${(streamFileSize / 1048576).toFixed(1)} MB = ${pct}% of the file. Nothing was saved on the server's disk.`;
+  }
+};
+
 $('info').onclick = () => call('/api/info');
 $('refresh').onclick = refresh;
 $('upload').onclick = async () => {
@@ -110,7 +149,9 @@ $('upload').onclick = async () => {
   const fd = new FormData();
   fd.append('video', file);
   await call('/api/upload', { method: 'POST', body: fd });
-  refresh();
+  const shown = out.textContent;   // keep the upload result visible
+  await refresh();                 // refresh() overwrites the result box, so put it back
+  out.textContent = shown;
 };
 </script>
 </body>

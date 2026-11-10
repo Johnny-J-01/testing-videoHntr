@@ -8,6 +8,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
+const { Readable } = require('stream');
 
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
 const FFPROBE = process.env.FFPROBE_PATH || require('ffprobe-static').path;
@@ -59,6 +60,66 @@ const validId = (req, res, next) =>
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
+
+// ---------- playback: relay bytes from Drive to a <video> tag (nothing is saved on disk) ----------
+// A <video> tag cannot send the x-admin-key header, so playback uses a short-lived random token
+// that is handed out by /api/stream-token/:id (which does require the admin key).
+const streamTokens = new Map(); // token -> { id, exp, stats }
+const TOKEN_TTL_MS = 10 * 60 * 1000;
+
+function newStreamToken(id) {
+  const now = Date.now();
+  for (const [t, v] of streamTokens) if (v.exp < now) streamTokens.delete(t);
+  const token = crypto.randomBytes(16).toString('hex');
+  streamTokens.set(token, {
+    id,
+    exp: now + TOKEN_TTL_MS,
+    stats: { requests: 0, bytesServed: 0, firstByteMs: [], ranges: [] },
+  });
+  return token;
+}
+
+app.get('/stream/:id', validId, async (req, res) => {
+  const entry = streamTokens.get(String(req.query.t || ''));
+  if (!entry || entry.id !== req.params.id || entry.exp < Date.now()) {
+    return res.status(403).send('Invalid or expired stream token');
+  }
+  entry.exp = Date.now() + TOKEN_TTL_MS; // sliding expiry while the video is being watched
+
+  const started = Date.now();
+  const abort = new AbortController();
+  res.on('close', () => abort.abort()); // user stopped, seeked or closed the tab: stop reading from Drive
+
+  try {
+    const headers = { Authorization: `Bearer ${await accessToken()}` };
+    if (req.headers.range) headers.Range = req.headers.range; // pass the browser's Range request straight to Drive
+    const up = await fetch(mediaUrl(req.params.id), { headers, signal: abort.signal });
+    const firstByteMs = Date.now() - started;
+
+    entry.stats.requests += 1;
+    entry.stats.firstByteMs.push(firstByteMs);
+    if (entry.stats.ranges.length < 40) entry.stats.ranges.push(req.headers.range || 'none');
+    console.log(`[stream] ${req.params.id} range=${req.headers.range || 'none'} -> ${up.status} in ${firstByteMs} ms`);
+
+    if (!up.ok) return res.status(up.status).send(`Drive returned ${up.status}`);
+
+    res.status(up.status); // 206 for a range request
+    res.set('Accept-Ranges', 'bytes'); // Drive does not send this header; the browser needs it to allow seeking
+    res.set('Cache-Control', 'no-store');
+    res.set('Content-Type', up.headers.get('content-type') || 'video/mp4');
+    if (up.headers.get('content-length')) res.set('Content-Length', up.headers.get('content-length'));
+    if (up.headers.get('content-range')) res.set('Content-Range', up.headers.get('content-range'));
+
+    const body = Readable.fromWeb(up.body);
+    body.on('data', (chunk) => (entry.stats.bytesServed += chunk.length));
+    body.on('error', () => res.destroy());
+    body.pipe(res);
+  } catch (e) {
+    if (!res.headersSent) res.status(502).send(`Stream failed: ${e.message}`);
+    else res.destroy();
+  }
+});
+
 // everything under /api needs the admin key (the app can write to your Drive)
 app.use('/api', (req, res, next) =>
   req.get('x-admin-key') === ADMIN_KEY ? next() : res.status(401).json({ error: 'Wrong or missing admin key' })
@@ -87,6 +148,25 @@ app.get('/api/netcheck', wrap(async (req, res) => {
     signal: r.signal,
     stderr: r.stderr,
     note: 'An HTTP/format error here is fine. A signal (e.g. SIGSEGV) or empty stderr with a non-zero exit means the binary itself breaks on network calls.',
+  });
+}));
+
+// Playback: hand out a short-lived stream token, and report what the stream actually fetched
+app.get('/api/stream-token/:id', validId, wrap(async (req, res) => {
+  const token = newStreamToken(req.params.id);
+  res.json({ token, url: `/stream/${req.params.id}?t=${token}`, expiresAfterIdleMin: TOKEN_TTL_MS / 60000 });
+}));
+
+app.get('/api/stream-stats/:token', wrap(async (req, res) => {
+  const e = streamTokens.get(req.params.token);
+  if (!e) return res.status(404).json({ error: 'Unknown or expired token' });
+  const t = e.stats.firstByteMs;
+  res.json({
+    requestsToDrive: e.stats.requests,
+    bytesServedMB: mb(e.stats.bytesServed),
+    firstByteMsAvg: t.length ? avg(t) : null,
+    firstByteMsMax: t.length ? Math.max(...t) : null,
+    rangesRequestedByPlayer: e.stats.ranges,
   });
 }));
 
